@@ -1,0 +1,846 @@
+// =============================================================================
+// LIFELINE ACHHAM - Prisma schema (Phase 1: Foundation)
+//
+// Implements: Organizations, Organization Settings, Users, Roles, Permissions,
+// Role-Permission + User-Role mappings, Audit Logs, and a transaction-safe
+// Numbering Engine (DocumentSequence) used by every later module
+// (LA-LM-0001, LA-RCP-0001, LA-CERT-0001, ...).
+//
+// Phase 2+ tables (members, membership_applications, payments, receipts,
+// certificates, income/expenses, notifications, etc.) are described in
+// docs/DATABASE_PLAN.md and will be added as their own migrations so the
+// app stays runnable after every phase, per the project's phased build plan.
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// -----------------------------------------------------------------------------
+// ORGANIZATION
+// -----------------------------------------------------------------------------
+
+model Organization {
+  id            String   @id @default(uuid())
+  name          String   @default("Lifeline Achham")
+  legalName     String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  settings      OrganizationSettings?
+  users         User[]
+  auditLogs     AuditLog[]
+  sequences     DocumentSequence[]
+
+  @@map("organizations")
+}
+
+// One settings row per organization. Nothing here is hard-coded in app code;
+// every screen reads from this table (see Section 3 of the spec).
+model OrganizationSettings {
+  id                    String   @id @default(uuid())
+  organizationId        String   @unique
+  organization          Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  logoUrl               String?
+  registrationNumber    String?
+  panVatNumber          String?
+
+  address               String?
+  district              String?
+  municipality          String?
+  ward                  String?
+
+  phone                 String?
+  mobile                String?
+  email                 String?
+  website               String?
+  facebookUrl           String?
+  instagramUrl          String?
+  otherSocialLinks      Json?    // [{ label, url }]
+
+  description           String?
+  stampImageUrl         String?
+  signatureImageUrl     String?
+
+  currency              String   @default("NPR")
+  dateFormat            String   @default("YYYY-MM-DD")
+
+  membershipIdPrefix    String   @default("LA-LM")
+  receiptPrefix         String   @default("LA-RCP")
+  certificatePrefix     String   @default("LA-CERT")
+  cardPrefix            String   @default("LA-CARD")
+  temporaryRegPrefix    String   @default("LA-TMP")
+  expensePrefix         String   @default("LA-EXP")
+  incomePrefix          String   @default("LA-INC")
+  paymentPrefix         String   @default("LA-PAY")
+  applicationPrefix     String   @default("LA-APP")
+
+  watermarkText         String   @default("LIFELINE ACHHAM")
+  watermarkOpacity      Float    @default(0.08)
+  watermarkEnabled      Boolean  @default(true)
+
+  expiringSoonDays      Int      @default(30) // membership expiry warning window
+
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  @@map("organization_settings")
+}
+
+// -----------------------------------------------------------------------------
+// USERS / ROLES / PERMISSIONS  (RBAC - see Section 4)
+// -----------------------------------------------------------------------------
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  DISABLED
+}
+
+model User {
+  id                String     @id @default(uuid())
+  organizationId    String
+  organization      Organization @relation(fields: [organizationId], references: [id])
+
+  fullName          String
+  email             String     @unique
+  passwordHash      String
+  phone             String?
+  avatarUrl         String?
+  status            UserStatus @default(ACTIVE)
+
+  isSuperAdmin      Boolean    @default(false) // convenience flag; still governed by permissions
+
+  twoFactorEnabled  Boolean    @default(false)
+  twoFactorSecret   String?    // encrypted at rest by the auth service, never returned via API
+
+  lastLoginAt       DateTime?
+  lastLoginIp       String?
+  failedLoginCount  Int        @default(0)
+  lockedUntil       DateTime?
+
+  passwordResetToken     String?  @unique
+  passwordResetExpiresAt DateTime?
+
+  createdAt         DateTime   @default(now())
+  updatedAt         DateTime   @updatedAt
+  deletedAt         DateTime?  // soft delete
+
+  roles             UserRole[]
+  sessions          Session[]
+  loginActivity     LoginActivity[]
+  auditLogs         AuditLog[]
+
+  reviewedApplications MembershipApplication[]    @relation("ApplicationReviewer")
+  applicationStatusChanges ApplicationStatusHistory[]
+  approvedMembers   Member[]
+  paymentsRecorded  Payment[] @relation("PaymentRecordedBy")
+  paymentsVerified  Payment[] @relation("PaymentVerifiedBy")
+  incomeCreated     Income[]  @relation("IncomeCreatedBy")
+  incomeApproved    Income[]  @relation("IncomeApprovedBy")
+  expensesCreated   Expense[] @relation("ExpenseCreatedBy")
+  expensesApproved  Expense[] @relation("ExpenseApprovedBy")
+  notifications     Notification[]
+  backupsCreated    Backup[]
+  templatesCreated  DocumentTemplate[] @relation("TemplateCreatedBy")
+  templatesUpdated  DocumentTemplate[] @relation("TemplateUpdatedBy")
+
+  @@index([organizationId])
+  @@map("users")
+}
+
+model Session {
+  id            String   @id @default(uuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  refreshToken  String   @unique
+  userAgent     String?
+  ipAddress     String?
+  expiresAt     DateTime
+  revokedAt     DateTime?
+  createdAt     DateTime @default(now())
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+model LoginActivity {
+  id          String   @id @default(uuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  success     Boolean
+  ipAddress   String?
+  userAgent   String?
+  reason      String?  // e.g. "invalid_password", "account_locked"
+  createdAt   DateTime @default(now())
+
+  @@index([userId])
+  @@map("login_activity")
+}
+
+model Role {
+  id             String   @id @default(uuid())
+  organizationId String
+  name           String   // e.g. "Super Admin", "Admin", "Accountant", "Staff"
+  slug           String   // e.g. "super-admin"
+  description    String?
+  isSystem       Boolean  @default(false) // system roles cannot be deleted
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  permissions    RolePermission[]
+  users          UserRole[]
+
+  @@unique([organizationId, slug])
+  @@map("roles")
+}
+
+// Canonical, seedable permission catalogue: "members.view", "payments.verify", etc.
+model Permission {
+  id          String   @id @default(uuid())
+  key         String   @unique // "members.view"
+  module      String   // "members"
+  action      String   // "view"
+  description String?
+
+  roles       RolePermission[]
+
+  @@map("permissions")
+}
+
+model RolePermission {
+  roleId       String
+  role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permissionId String
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+model UserRole {
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  roleId String
+  role   Role   @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([userId, roleId])
+  @@map("user_roles")
+}
+
+// -----------------------------------------------------------------------------
+// AUDIT LOG (Section 27)
+// -----------------------------------------------------------------------------
+
+model AuditLog {
+  id             String   @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  userId         String?
+  user           User?    @relation(fields: [userId], references: [id])
+
+  action         String   // "member.create", "payment.verify", "role.create"
+  module         String   // "members", "payments", "roles"
+  recordId       String?
+  oldValue       Json?
+  newValue       Json?
+  ipAddress      String?
+  createdAt      DateTime @default(now())
+
+  @@index([organizationId, module])
+  @@index([recordId])
+  @@map("audit_logs")
+}
+
+// -----------------------------------------------------------------------------
+// NUMBERING ENGINE (Section 37) - transaction-safe sequence generator used by
+// every future module (members, receipts, certificates, cards, payments...).
+// -----------------------------------------------------------------------------
+
+model DocumentSequence {
+  id             String   @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  key            String   // "membership_id" | "receipt" | "certificate" | "card" | ...
+  prefix         String   // e.g. "LA-LM"
+  separator      String   @default("-")
+  padLength      Int      @default(4)
+  lastNumber     Int      @default(0)
+
+  updatedAt      DateTime @updatedAt
+
+  @@unique([organizationId, key])
+  @@map("document_sequences")
+}
+
+// -----------------------------------------------------------------------------
+// SYSTEM SETTINGS (generic key/value, for anything not covered by
+// OrganizationSettings - e.g. feature flags for later phases)
+// -----------------------------------------------------------------------------
+
+model SystemSetting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+
+  @@map("system_settings")
+}
+
+// =============================================================================
+// PHASE 2 — MEMBERSHIP
+// Adds: Nepal administrative reference data, Membership Types, Members,
+// Membership Applications, and the application status history trail.
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// NEPAL ADMINISTRATIVE DATA (Section 8) — normalized so it can be extended
+// later rather than hard-coded in the frontend. Seeded with a starter set
+// (all 77 districts, full municipality list for Achham); other districts'
+// municipalities can be added the same way without a schema change.
+// -----------------------------------------------------------------------------
+
+model District {
+  id            String         @id @default(uuid())
+  name          String         @unique
+  province      String?
+  displayOrder  Int            @default(0)
+
+  municipalities Municipality[]
+  applications   MembershipApplication[]
+  members        Member[]
+
+  @@map("districts")
+}
+
+enum MunicipalityType {
+  METROPOLITAN_CITY
+  SUB_METROPOLITAN_CITY
+  MUNICIPALITY
+  RURAL_MUNICIPALITY
+}
+
+model Municipality {
+  id           String            @id @default(uuid())
+  districtId   String
+  district     District          @relation(fields: [districtId], references: [id])
+  name         String
+  type         MunicipalityType  @default(MUNICIPALITY)
+  wardCount    Int               @default(9)
+
+  applications MembershipApplication[]
+  members      Member[]
+
+  @@unique([districtId, name])
+  @@map("municipalities")
+}
+
+// -----------------------------------------------------------------------------
+// MEMBERSHIP TYPES (Section 7) — dynamic, never hard-coded.
+// -----------------------------------------------------------------------------
+
+model MembershipType {
+  id             String   @id @default(uuid())
+  organizationId String
+  name           String
+  description    String?
+  price          Decimal  @db.Decimal(12, 2)
+  durationDays   Int?     // null = lifetime, no expiry
+  isActive       Boolean  @default(true)
+  displayOrder   Int      @default(0)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  applications   MembershipApplication[]
+  members        Member[]
+
+  @@unique([organizationId, name])
+  @@map("membership_types")
+}
+
+// -----------------------------------------------------------------------------
+// MEMBERSHIP APPLICATIONS (Section 8, 9, 12)
+// -----------------------------------------------------------------------------
+
+enum Gender {
+  MALE
+  FEMALE
+  OTHER
+}
+
+enum ApplicationStatus {
+  DRAFT
+  SUBMITTED
+  PAYMENT_PENDING
+  PAYMENT_SUCCESS
+  PAYMENT_FAILED
+  UNDER_REVIEW
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+model MembershipApplication {
+  id                 String            @id @default(uuid())
+  organizationId     String
+  applicationNumber  String            @unique // LA-APP-0001
+
+  fullName           String
+  dateOfBirth        DateTime
+  gender             Gender
+
+  districtId         String
+  district           District          @relation(fields: [districtId], references: [id])
+  municipalityId     String
+  municipality       Municipality      @relation(fields: [municipalityId], references: [id])
+  wardNo             Int
+  tole               String?
+
+  email              String
+  mobile             String
+  countryCode        String            @default("+977")
+  socialLinks        Json?             // [{ platform, url }]
+
+  membershipTypeId   String
+  membershipType     MembershipType    @relation(fields: [membershipTypeId], references: [id])
+  membershipFee      Decimal           @db.Decimal(12, 2) // snapshot at submission time
+
+  status             ApplicationStatus @default(SUBMITTED)
+
+  reviewedById       String?
+  reviewedBy         User?             @relation("ApplicationReviewer", fields: [reviewedById], references: [id])
+  reviewedAt         DateTime?
+  reviewRemarks      String?
+
+  memberId           String?           @unique
+  member             Member?           @relation(fields: [memberId], references: [id])
+
+  createdAt          DateTime          @default(now())
+  updatedAt          DateTime          @updatedAt
+
+  statusHistory      ApplicationStatusHistory[]
+  payments           Payment[]
+  temporaryRegistration TemporaryRegistration?
+
+  @@index([organizationId, status])
+  @@map("membership_applications")
+}
+
+model ApplicationStatusHistory {
+  id            String                 @id @default(uuid())
+  applicationId String
+  application   MembershipApplication  @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  fromStatus    ApplicationStatus?
+  toStatus      ApplicationStatus
+  changedById   String?
+  changedBy     User?                  @relation(fields: [changedById], references: [id])
+  remarks       String?
+  createdAt     DateTime               @default(now())
+
+  @@map("application_status_history")
+}
+
+// -----------------------------------------------------------------------------
+// MEMBERS (Section 6) — created only once an application is approved.
+// -----------------------------------------------------------------------------
+
+enum MemberStatus {
+  ACTIVE
+  EXPIRING_SOON
+  EXPIRED
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+model Member {
+  id                 String          @id @default(uuid())
+  organizationId     String
+
+  memberId           String          @unique // LA-LM-0001
+
+  fullName           String
+  dateOfBirth        DateTime
+  gender             Gender
+
+  districtId         String
+  district           District        @relation(fields: [districtId], references: [id])
+  municipalityId     String
+  municipality       Municipality    @relation(fields: [municipalityId], references: [id])
+  wardNo             Int
+  tole               String?
+
+  email              String
+  mobile             String
+  countryCode        String          @default("+977")
+  socialLinks        Json?
+
+  membershipTypeId   String
+  membershipType     MembershipType  @relation(fields: [membershipTypeId], references: [id])
+  membershipDate     DateTime
+  membershipPrice    Decimal         @db.Decimal(12, 2)
+  expiresAt          DateTime?       // null = lifetime
+
+  receiptNumber      String?
+  paymentMethod      String?
+
+  certificateNumber  String?         // assigned in Phase 4
+  cardNumber         String?         // assigned in Phase 4
+
+  approvalStatus     ApprovalStatus  @default(APPROVED) // a Member row only exists post-approval
+  approvedById       String?
+  approvedBy         User?           @relation(fields: [approvedById], references: [id])
+  approvedAt         DateTime?
+  remarks            String?
+
+  profilePhotoUrl    String?
+  bloodGroup         String?         // e.g. "A+", "O-" - free text, not an enum (some
+                                      // members may not know it precisely; validating
+                                      // against a fixed list isn't worth rejecting a
+                                      // real registration over)
+
+  createdAt          DateTime        @default(now())
+  updatedAt          DateTime        @updatedAt
+  deletedAt          DateTime?
+
+  application        MembershipApplication?
+  incomeEntries      Income[]
+  payments           Payment[]
+
+  @@index([organizationId])
+  @@map("members")
+}
+
+// =============================================================================
+// PHASE 3 — PAYMENTS
+// Adds: Payment + PaymentTransaction (raw gateway audit trail), and the
+// gating rule that an application can only be approved once it has a
+// verified payment (enforced in ApplicationsService, not just the UI).
+// =============================================================================
+
+enum PaymentMethodType {
+  ESEWA
+  KHALTI
+  CONNECTIPS
+  CASH
+  BANK_DEPOSIT
+  CHEQUE
+  OTHER
+}
+
+// Note on Section 38: the spec lists a separate `payment_methods` table.
+// Since the method set is small and fixed by the organization's actual
+// integrations (not user-creatable like membership types), it's modeled as
+// an enum here rather than a table — see docs/DATABASE_PLAN.md for the same
+// kind of documented deviation made for member addresses in Phase 2.
+enum PaymentStatus {
+  PENDING
+  PROCESSING
+  PAID
+  FAILED
+  REFUNDED
+  MANUALLY_VERIFIED
+}
+
+model Payment {
+  id                String            @id @default(uuid())
+  organizationId    String
+  paymentNumber     String            @unique // LA-PAY-0001
+
+  // Exactly one of applicationId / memberId is set: application-flow
+  // payments (public applicant paid online/offline before approval) use
+  // applicationId; direct billing for an already-registered member (no
+  // online application ever existed) uses memberId instead. Both feed the
+  // same receipt/verification machinery below.
+  applicationId     String?
+  application       MembershipApplication? @relation(fields: [applicationId], references: [id])
+  memberId          String?
+  member            Member?           @relation(fields: [memberId], references: [id])
+
+  amount            Decimal           @db.Decimal(12, 2)
+  currency          String            @default("NPR")
+  method            PaymentMethodType
+  status            PaymentStatus     @default(PENDING)
+
+  // Online payments: the gateway's own transaction/reference id, used to
+  // call its server-side verification endpoint (Section 10 - never trust
+  // the browser redirect alone).
+  gatewayReference  String?
+  failureReason     String?
+  receiptNumber     String?           @unique // LA-RCP-0001, assigned lazily on first receipt PDF generation
+
+  // Offline payments: who recorded/verified it and any free-text reference
+  // (cheque number, bank deposit slip number, etc).
+  recordedById      String?
+  recordedBy        User?             @relation("PaymentRecordedBy", fields: [recordedById], references: [id])
+  verifiedById      String?
+  verifiedBy        User?             @relation("PaymentVerifiedBy", fields: [verifiedById], references: [id])
+  verifiedAt        DateTime?
+  offlineReference  String?           // cheque no. / deposit slip no. / other note
+  remarks           String?
+
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+
+  transactions      PaymentTransaction[]
+  incomeEntry       Income?
+
+  @@index([organizationId, status])
+  @@index([applicationId])
+  @@map("payments")
+}
+
+// Raw gateway callback/verification payloads, kept separate from Payment so
+// verification is fully auditable (Section 10) without bloating the main
+// row or ever overwriting evidence of what the gateway actually returned.
+model PaymentTransaction {
+  id          String   @id @default(uuid())
+  paymentId   String
+  payment     Payment  @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  direction   String   // "initiate" | "callback" | "verify"
+  rawPayload  Json
+  createdAt   DateTime @default(now())
+
+  @@map("payment_transactions")
+}
+
+// =============================================================================
+// PHASE 4 — DOCUMENTS
+// Temporary registrations get their own small table (issued once, right
+// after payment succeeds). Membership cards and certificates reuse the
+// `cardNumber` / `certificateNumber` fields already on Member (Phase 2) -
+// assigned lazily, the first time each document is generated, via the same
+// transaction-safe numbering engine as everything else. Receipts reuse
+// Payment, with its own `receiptNumber` assigned lazily the same way.
+// =============================================================================
+
+model TemporaryRegistration {
+  id                 String    @id @default(uuid())
+  organizationId     String
+  applicationId      String    @unique
+  application        MembershipApplication @relation(fields: [applicationId], references: [id])
+  registrationNumber String    @unique // LA-TMP-0001
+  issuedAt           DateTime  @default(now())
+
+  @@map("temporary_registrations")
+}
+
+// =============================================================================
+// PHASE 5 — FINANCE
+// Income/expense categories are dynamic tables (Super Admin can add more,
+// per Sections 18-19), seeded with the spec's defaults. Membership payments
+// automatically create an approved Income row the moment a payment is
+// verified (Section 18) - Income.relatedPaymentId is unique so this is
+// idempotent even if verification is somehow triggered twice.
+// =============================================================================
+
+model IncomeCategory {
+  id             String   @id @default(uuid())
+  organizationId String
+  name           String
+  isActive       Boolean  @default(true)
+  displayOrder   Int      @default(0)
+  createdAt      DateTime @default(now())
+
+  income         Income[]
+
+  @@unique([organizationId, name])
+  @@map("income_categories")
+}
+
+model Income {
+  id                String    @id @default(uuid())
+  organizationId    String
+  incomeNumber      String    @unique // LA-INC-0001
+
+  date              DateTime  @default(now())
+  categoryId        String
+  category          IncomeCategory @relation(fields: [categoryId], references: [id])
+  description       String?
+  amount            Decimal   @db.Decimal(12, 2)
+  paymentMethod     String?
+  referenceNumber   String?
+
+  relatedMemberId   String?
+  relatedMember     Member?   @relation(fields: [relatedMemberId], references: [id])
+  relatedPaymentId  String?   @unique // set when auto-generated from a verified Payment
+  relatedPayment    Payment?  @relation(fields: [relatedPaymentId], references: [id])
+
+  attachmentUrl     String?
+  remarks           String?
+
+  createdById       String?
+  createdBy         User?     @relation("IncomeCreatedBy", fields: [createdById], references: [id])
+  approvedById      String?
+  approvedBy        User?     @relation("IncomeApprovedBy", fields: [approvedById], references: [id])
+  approvedAt        DateTime?
+
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+  deletedAt         DateTime? // soft delete only (Section 48: financial records never casually deleted)
+
+  @@index([organizationId, date])
+  @@map("income")
+}
+
+model ExpenseCategory {
+  id             String   @id @default(uuid())
+  organizationId String
+  name           String
+  isActive       Boolean  @default(true)
+  displayOrder   Int      @default(0)
+  createdAt      DateTime @default(now())
+
+  expenses       Expense[]
+
+  @@unique([organizationId, name])
+  @@map("expense_categories")
+}
+
+model Expense {
+  id                String    @id @default(uuid())
+  organizationId    String
+  expenseNumber     String    @unique // LA-EXP-0001
+
+  date              DateTime  @default(now())
+  categoryId        String
+  category          ExpenseCategory @relation(fields: [categoryId], references: [id])
+  description       String?
+  amount            Decimal   @db.Decimal(12, 2)
+  paymentMethod     String?
+  paidTo            String?
+  billNumber        String?
+
+  attachmentUrl     String?
+  remarks           String?
+
+  createdById       String?
+  createdBy         User?     @relation("ExpenseCreatedBy", fields: [createdById], references: [id])
+  approvedById      String?
+  approvedBy        User?     @relation("ExpenseApprovedBy", fields: [approvedById], references: [id])
+  approvedAt        DateTime?
+
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+  deletedAt         DateTime?
+
+  @@index([organizationId, date])
+  @@map("expenses")
+}
+
+// =============================================================================
+// PHASE 7 — ADVANCED
+// Notifications (Section 25) and Backup metadata (Section 30). The AI
+// assistant (Section 31) needs no new tables - it only reads through
+// existing services.
+// =============================================================================
+
+model Notification {
+  id               String   @id @default(uuid())
+  organizationId   String
+  userId           String
+  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  type             String   // "new_application" | "payment_success" | "payment_failed" | ...
+  title            String
+  message          String
+  link             String?
+  relatedRecordId  String?  // used to de-duplicate generated notifications (e.g. one per expiring member)
+
+  isRead           Boolean  @default(false)
+  createdAt        DateTime @default(now())
+
+  @@index([organizationId, userId, isRead])
+  @@map("notifications")
+}
+
+enum BackupType {
+  MANUAL
+  AUTOMATIC
+}
+
+enum BackupStatus {
+  IN_PROGRESS
+  COMPLETED
+  FAILED
+}
+
+model Backup {
+  id             String       @id @default(uuid())
+  organizationId String
+  type           BackupType
+  status         BackupStatus @default(IN_PROGRESS)
+  filePath       String?
+  fileSizeBytes  Int?
+  errorMessage   String?
+
+  createdById    String?
+  createdBy      User?        @relation(fields: [createdById], references: [id])
+
+  startedAt      DateTime     @default(now())
+  completedAt    DateTime?
+
+  @@map("backups")
+}
+
+// =============================================================================
+// DOCUMENT TEMPLATES (theme editor for cards/certificates)
+// One row per organization per document type - deliberately NOT a full
+// multi-template library with a picker (most orgs have one brand, not
+// several to switch between); "editing the theme" means updating this one
+// row. A logo/reference image can be uploaded (stored as base64 - no
+// object storage is wired up yet, see docs/DATABASE_PLAN.md, so this is
+// the pragmatic way to support image upload without that infrastructure).
+// =============================================================================
+
+enum DocumentTemplateType {
+  CARD
+  CERTIFICATE
+}
+
+// A template's front/back is a JSON array of positioned elements, e.g.:
+// [{ id, kind: "text"|"image"|"shape"|"field", x, y, width, height,
+//    rotation, zIndex, locked, hidden, text?, field? (e.g. "memberName",
+//    "memberId", "qr", "photo", "orgLogo", "validUntil", ...), fontFamily?,
+//    fontSize?, color?, align?, imageData? (base64), shapeType?,
+//    fillColor?, borderColor?, borderWidth? }]
+// "field" elements are placeholders resolved with real member/org data at
+// generation time - never static/fake content in the generated PDF.
+model DocumentTemplate {
+  id                String               @id @default(uuid())
+  organizationId    String
+  type              DocumentTemplateType
+
+  name              String
+  isDefault         Boolean              @default(false)
+
+  backgroundColor   String               @default("#FFFFFF")
+  frontLayout       Json                 @default("[]")
+  backLayout        Json?                // certificates only use front; cards use both
+
+  referenceImageFront String?            @db.Text // base64 guide image, uploaded by admin, never printed
+  referenceImageBack  String?            @db.Text
+
+  customFontData    String?              @db.Text // base64 .ttf/.otf for Nepali/Devanagari text in this template
+
+  createdById       String?
+  createdBy         User?                @relation("TemplateCreatedBy", fields: [createdById], references: [id])
+  updatedById       String?
+  updatedBy         User?                @relation("TemplateUpdatedBy", fields: [updatedById], references: [id])
+
+  createdAt         DateTime             @default(now())
+  updatedAt         DateTime             @updatedAt
+
+  @@index([organizationId, type])
+  @@map("document_templates")
+}

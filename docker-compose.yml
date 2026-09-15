@@ -1,0 +1,37 @@
+# Local development database only. Production deployments should use a
+# managed PostgreSQL instance (see README.md → Deployment).
+version: "3.8"
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: lifeline
+      POSTGRES_PASSWORD: lifeline
+      POSTGRES_DB: lifeline_achham
+    ports:
+      - "5432:5432"
+    volumes:
+      - lifeline_pgdata:/var/lib/postgresql/data
+
+  # Optional: a local pgAdmin UI for browsing the database. Not started by
+  # default `docker compose up -d` - opt in with:
+  #   docker compose --profile tools up -d
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    restart: unless-stopped
+    profiles: ["tools"]
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@lifelineachham.dev
+      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+    ports:
+      - "5050:80"
+    volumes:
+      - lifeline_pgadmin:/var/lib/pgadmin
+    depends_on:
+      - postgres
+
+volumes:
+  lifeline_pgdata:
+  lifeline_pgadmin:

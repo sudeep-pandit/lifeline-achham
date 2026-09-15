@@ -1,0 +1,42 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "DB: start postgres (docker compose)",
+      "type": "shell",
+      "command": "docker compose up -d",
+      "problemMatcher": []
+    },
+    {
+      "label": "API: install deps",
+      "type": "shell",
+      "command": "npm install",
+      "problemMatcher": []
+    },
+    {
+      "label": "API: prisma generate + migrate + seed",
+      "type": "shell",
+      "command": "cd apps/api && npx prisma generate && npx prisma migrate dev --name init && npm run prisma:seed",
+      "problemMatcher": []
+    },
+    {
+      "label": "API: dev server",
+      "type": "shell",
+      "command": "npm run dev:api",
+      "isBackground": true,
+      "problemMatcher": []
+    },
+    {
+      "label": "Web: dev server",
+      "type": "shell",
+      "command": "npm run dev:web",
+      "isBackground": true,
+      "problemMatcher": []
+    },
+    {
+      "label": "Run: API + Web together",
+      "dependsOn": ["API: dev server", "Web: dev server"],
+      "problemMatcher": []
+    }
+  ]
+}
